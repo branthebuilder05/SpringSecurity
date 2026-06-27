@@ -1,0 +1,126 @@
+Here's a complete interview-ready writeup on Spring Security form-based authentication flow:
+
+---
+
+## Spring Security — DB Authentication Flow
+
+### What happens when a user hits POST /login
+
+**1. Filter Chain intercepts the request**
+Every request in Spring Boot passes through a `FilterChainProxy` before reaching your controller. `FilterChainProxy` maintains a list of security filters and passes the request through each one in order. For a login request, the key filter is `UsernamePasswordAuthenticationFilter`.
+
+**2. UsernamePasswordAuthenticationFilter extracts credentials**
+This filter checks if the request is `POST /login`. If yes, it extracts username and password from the request body and creates an **unauthenticated** `UsernamePasswordAuthenticationToken`:
+```java
+UsernamePasswordAuthenticationToken {
+    principal     = "shashank"       // raw string
+    credentials   = "password123"    // raw string
+    authorities   = []               // empty
+    authenticated = false
+}
+```
+
+**3. ProviderManager delegates to DaoAuthenticationProvider**
+The unauthenticated token is passed to `ProviderManager` which is the default implementation of `AuthenticationManager`. `ProviderManager` doesn't do authentication itself — it iterates its list of `AuthenticationProvider`s and finds `DaoAuthenticationProvider` which supports `UsernamePasswordAuthenticationToken`.
+
+**4. DaoAuthenticationProvider calls UserDetailsService**
+`DaoAuthenticationProvider` calls `loadUserByUsername(username)` on your `UserDetailsService` implementation. This is the only class you write — it queries the DB and returns a `UserDetails` object containing the encoded password and roles.
+
+**5. Password verification**
+`DaoAuthenticationProvider` passes the raw password from the request and the encoded password from `UserDetails` to `PasswordEncoder.matches()`:
+```java
+passwordEncoder.matches("password123", "$2a$10$hashed...") // true or false
+```
+BCrypt hashes the raw password with the same salt embedded in the stored hash and compares results. If they don't match, `BadCredentialsException` is thrown.
+
+**6. Authenticated token is created**
+If passwords match, a new `UsernamePasswordAuthenticationToken` is created using the 3-argument constructor — this time fully authenticated:
+```java
+UsernamePasswordAuthenticationToken {
+    principal     = UserDetails { username, password, roles }  // full object
+    credentials   = null           // wiped for security
+    authorities   = [ROLE_USER]    // loaded from DB
+    authenticated = true           // locked — cannot be changed externally
+}
+```
+
+**7. SecurityContext is populated**
+The authenticated token is stored in `SecurityContextHolder`:
+```java
+SecurityContextHolder.getContext().setAuthentication(authenticatedToken);
+```
+`SecurityContextHolder` uses a `ThreadLocal` — making the authentication accessible anywhere on the current thread without passing it around as a method argument.
+
+**8. Session is created**
+Spring Security creates an `HttpSession` and stores the `SecurityContext` in it under the key `SPRING_SECURITY_CONTEXT`. The servlet container sends `Set-Cookie: JSESSIONID=abc123` in the response. The browser stores this cookie and sends it on every subsequent request.
+
+**9. AuthenticationSuccessHandler fires**
+Default behavior redirects to the configured success URL. You can customize this to return JSON instead for REST APIs.
+
+---
+
+### What happens on subsequent requests
+
+**1. SecurityContextHolderFilter runs first**
+On every request, before any other filter, `SecurityContextHolderFilter` reads the `JSESSIONID` cookie, looks up the `HttpSession` in the server-side session store, retrieves the `SecurityContext` and sets it into `SecurityContextHolder`.
+
+**2. Authorization filter checks roles**
+`AuthorizationFilter` reads the `Authentication` from `SecurityContextHolder` and checks if the user has the required role for the requested URL.
+
+**3. Controller runs**
+Your controller can access the authenticated user anywhere via:
+```java
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+auth.getName();          // "shashank"
+auth.getAuthorities();   // [ROLE_USER]
+auth.getPrincipal();     // UserDetails object
+```
+
+**4. Context is cleared after request**
+After the response is sent, `SecurityContextHolder.clearContext()` is called in a `finally` block. This is critical because Spring runs on a thread pool — threads are reused across requests. Without clearing, the next request on the same thread would inherit the previous user's authentication.
+
+---
+
+### Key objects and their roles
+
+| Object | Role |
+|---|---|
+| `UsernamePasswordAuthenticationToken` | Carries credentials (unauthenticated) or principal+authorities (authenticated) |
+| `SecurityContext` | Thin wrapper that holds the `Authentication` object |
+| `SecurityContextHolder` | `ThreadLocal` store — makes auth accessible anywhere on current thread |
+| `HttpSession` | Server-side persistent store for `SecurityContext` across requests |
+| `JSESSIONID` | Cookie sent by browser — key to look up the right `HttpSession` |
+| `UserDetails` | Spring's contract for your user object — bridge between your entity and Spring Security |
+| `UserDetailsService` | Your code — queries DB, returns `UserDetails` |
+| `DaoAuthenticationProvider` | Spring's code — orchestrates `UserDetailsService` + `PasswordEncoder` |
+| `PasswordEncoder` | BCrypt — one-way hash comparison, never decrypts |
+| `FilterChainProxy` | Entry point — passes every request through the security filter chain |
+
+---
+
+### Key design decisions worth mentioning in interviews
+
+**Why ThreadLocal for SecurityContextHolder?**
+Each thread processes exactly one request at a time in the traditional servlet model. `ThreadLocal` makes the auth object available anywhere in the call stack — services, repositories, utility classes — without passing it as a method argument through every layer.
+
+**Why BCrypt?**
+BCrypt is a one-way hash with a built-in salt and cost factor. The salt prevents rainbow table attacks. The cost factor (default 10 = 2^10 rounds) makes brute force slow. You can increase the cost factor as hardware gets faster without changing stored passwords.
+
+**Why credentials are nulled after authentication?**
+After `DaoAuthenticationProvider` verifies the password, it sets `credentials = null` on the authenticated token before storing it in the session. The raw password never persists beyond the authentication step.
+
+**Why session fixation protection matters?**
+Spring Security rotates the `JSESSIONID` after successful login by default (`sessionFixation().migrateSession()`). This prevents attackers from pre-setting a session ID, tricking a user into logging in with it, and then hijacking that authenticated session.
+
+**Why `UsernameNotFoundException` is converted to `BadCredentialsException`?**
+Security — if the server returned different errors for "username not found" vs "wrong password", attackers could enumerate valid usernames. Both cases return the same `BadCredentialsException` by default.
+
+---
+
+### Production considerations worth mentioning
+
+- **Externalize sessions to Redis** via `spring-session-data-redis` — otherwise sessions live in JVM heap, lost on restart, not shared across instances
+- **Set session timeout** — `server.servlet.session.timeout=30m`
+- **Secure cookie flags** — `http-only=true` (blocks JS access, prevents XSS stealing the cookie), `secure=true` (only sent over HTTPS)
+- **Limit concurrent sessions** — `maximumSessions(1)` prevents one account being logged in from multiple places simultaneously
+- **JWT for stateless APIs** — replaces session entirely, auth state lives in the token on the client side, no server-side session store needed
