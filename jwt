@@ -1,0 +1,144 @@
+## JWT Authentication — concept first before code
+
+Before touching code, you need to understand what JWT is and why it exists — otherwise the code won't make sense.
+
+---
+
+### Problem with sessions at scale
+
+You understood sessions deeply. Here's where they break:
+
+```
+User logs in → Instance 1 creates session ABC → stores in JVM memory
+
+Next request → Load balancer routes to Instance 2
+             → Instance 2 has no session ABC
+             → User gets logged out
+```
+
+You can fix this with Redis (shared session store) — but now every request needs a Redis round trip. Extra network call, extra infrastructure, extra failure point.
+
+---
+
+### What JWT does differently
+
+Instead of storing auth state on the **server**, JWT stores it on the **client**:
+
+```
+User logs in → Server verifies credentials
+             → Server creates a signed token containing user info
+             → Sends token to client
+             → Client stores it (localStorage or cookie)
+
+Next request → Client sends token in every request
+             → ANY server instance can verify it independently
+             → No shared storage needed
+```
+
+---
+
+### What a JWT looks like
+
+A JWT is just a string with three parts separated by dots:
+
+```
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzaGFzaGFuayIsInJvbGUiOiJST0xFX1VTRVIiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDAwMH0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+Three parts:
+
+**Part 1 — Header** (algorithm used)
+```json
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+```
+
+**Part 2 — Payload** (the actual user data — called claims)
+```json
+{
+  "sub": "shashank",
+  "role": "ROLE_USER",
+  "iat": 1700000000,   // issued at
+  "exp": 1700086400    // expires at (24hrs later)
+}
+```
+
+**Part 3 — Signature** (tamper protection)
+```
+HMACSHA256(
+  base64(header) + "." + base64(payload),
+  secretKey
+)
+```
+
+Each part is just **Base64 encoded** — not encrypted. Anyone can decode part 1 and 2 and read them. The signature is what makes it trustworthy — if anyone tampers with the payload, the signature verification fails.
+
+---
+
+### How it fits into Spring Security filter chain
+
+With sessions, the flow was:
+```
+Request → SecurityContextHolderFilter reads JSESSIONID
+        → looks up HttpSession
+        → restores SecurityContext
+```
+
+With JWT, you **replace** that with your own custom filter:
+```
+Request → JwtAuthFilter (YOUR custom filter) reads Authorization header
+        → extracts token
+        → verifies signature
+        → reads username from payload
+        → calls loadUserByUsername()
+        → creates authenticated token
+        → sets in SecurityContextHolder
+```
+
+Everything after that — `AuthorizationFilter`, your controller, `auth.getName()` — stays **exactly the same**. Only the "how did we establish who this user is" part changes.
+
+---
+
+### How the token is sent
+
+Client sends JWT in every request via the `Authorization` header:
+```
+GET /private HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+```
+
+`Bearer` is just a convention meaning "I am presenting this token as proof of identity".
+
+---
+
+### Session vs JWT side by side
+
+| | Session | JWT |
+|---|---|---|
+| State stored | Server (memory/Redis) | Client (token) |
+| Each request | DB/Redis lookup | Signature verification (CPU only) |
+| Logout | Delete session instantly | Token lives until expiry — hard to invalidate |
+| Horizontal scaling | Needs sticky sessions or Redis | Any instance verifies independently |
+| Token expiry | Session timeout | `exp` claim in payload |
+| Best for | Traditional web apps | REST APIs, microservices |
+
+---
+
+### What we'll build
+
+We'll add JWT on top of the existing project:
+
+1. Add JWT dependency (`jjwt` library)
+2. `JwtService` — generates and validates tokens
+3. `JwtAuthFilter` — your custom filter that reads token from every request
+4. Update `SecurityConfig` — disable sessions, register your filter
+5. Update `AuthController` — return JWT token on login instead of session
+6. Test the full flow with curl
+
+The `User` entity, `UserDetailsService`, `UserDetails` — all stays exactly the same. JWT only changes how the filter chain establishes identity.
+
+---
+
+Clear on the concept? Any questions before we start coding — especially on how the signature works or why payload isn't encrypted?
